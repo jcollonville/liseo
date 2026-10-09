@@ -1,0 +1,1277 @@
+diff --git a/README.md b/README.md
+index 9a576df..aa18e88 100644
+--- a/README.md
++++ b/README.md
+@@ -15,7 +15,6 @@ Main functions to use from gourou::DRMProcessor are:
+   * Get an ePub from an ACSM file : _fulfill()_ and _download()_
+   * Create a new device : _createDRMProcessor()_
+   * Register a new device : _signIn()_ and _activateDevice()_
+-  * Remove DRM : _removeDRM()_
+   * Return loaned book : _returnLoan()_
+ 
+ You can import configuration from (at least):
+@@ -27,9 +26,6 @@ Or create a new one. Be careful: there is a limited number of devices that can b
+ 
+ ePub are encrypted using a shared key: one account / multiple devices, so you can create and register a device into your computer and read downloaded (and encrypted) ePub file with your eReader configured using the same AdobeID account.
+ 
+-For those who want to remove DRM without adept_remove, you can export your private key and import it within [Calibre](https://calibre-ebook.com/) an its DeDRM plugin.
+-
+-
+ Dependencies
+ ------------
+ 
+@@ -108,14 +104,6 @@ To download an ePub/PDF:
+ 
+     ./utils/acsmdownloader <ACSM_FILE>
+ 
+-To export your private key (for DeDRM software):
+-
+-    ./utils/acsmdownloader --export-private-key [-o adobekey_1.der]
+-
+-To remove ADEPT DRM:
+-
+-    ./utils/adept_remove <encryptedFile>
+-
+ To list loaned books:
+ 
+     ./utils/adept_loan_mgt [-l]
+diff --git a/include/libgourou.h b/include/libgourou.h
+index 292ebbb..d9c6278 100644
+--- a/include/libgourou.h
++++ b/include/libgourou.h
+@@ -179,11 +179,6 @@ namespace gourou
+          */
+         std::string serializeRSAPrivateKey(void* rsa);
+ 
+-        /**
+-         * @brief Export clear private license key into path
+-         */
+-        void exportPrivateLicenseKey(std::string path);
+-
+         /**
+          * @brief Get current user
+          */
+@@ -199,18 +194,6 @@ namespace gourou
+          */
+         DRMProcessorClient* getClient() { return client; }
+ 
+-        /**
+-         * @brief Remove ADEPT DRM
+-         * Warning: for PDF format, filenameIn must be different than filenameOut
+-         *
+-         * @param filenameIn         Input file (with ADEPT DRM)
+-         * @param filenameOut        Output file (without ADEPT DRM)
+-         * @param type               Type of file (ePub or PDF)
+-         * @param encryptionKey      Optional encryption key, do not try to decrypt the one inside input file
+-         * @param encryptionKeySize  Size of encryption key (if provided)
+-         */
+-        void removeDRM(const std::string& filenameIn, const std::string& filenameOut, ITEM_TYPE type, const unsigned char* encryptionKey=0, unsigned encryptionKeySize=0);
+-
+     private:
+         gourou::DRMProcessorClient* client;
+         gourou::Device* device;
+@@ -238,14 +221,6 @@ namespace gourou
+         void buildNotifyReq(pugi::xml_document& returnReq, pugi::xml_node& body);
+         void notifyServer(pugi::xml_node& notifyRoot);
+         void notifyServer(pugi::xml_document& fulfillReply);
+-        std::string encryptedKeyFirstPass(pugi::xml_document& rightsDoc, const std::string& encryptedKey, const std::string& keyType);
+-        void decryptADEPTKey(pugi::xml_document& rightsDoc, unsigned char* decryptedKey, const unsigned char* encryptionKey=0, unsigned encryptionKeySize=0);
+-        void removeEPubDRM(const std::string& filenameIn, const std::string& filenameOut, const unsigned char* encryptionKey, unsigned encryptionKeySize);
+-        void generatePDFObjectKey(int version,
+-                                  const unsigned char* masterKey, unsigned int masterKeyLength,
+-                                  int objectId, int objectGenerationNumber,
+-                                  unsigned char* keyOut);
+-        void removePDFDRM(const std::string& filenameIn, const std::string& filenameOut, const unsigned char* encryptionKey, unsigned encryptionKeySize);
+     };
+ }
+ 
+diff --git a/src/libgourou.cpp b/src/libgourou.cpp
+index 80a5f78..f7be694 100644
+--- a/src/libgourou.cpp
++++ b/src/libgourou.cpp
+@@ -692,7 +692,9 @@ namespace gourou
+         std::string loginMethod = user->getLoginMethod();
+ 
+         if (adobeID == "anonymous")
+-            signIn.append_attribute("method") = "anonymous";
++        {
++            EXCEPTION(SIGN_INVALID_CREDENTIALS, "Anonymous activation is disabled");
++        }
+         else if (loginMethod.size())
+             signIn.append_attribute("method") = loginMethod.c_str();
+         else
+@@ -1047,24 +1049,7 @@ namespace gourou
+         return res.toBase64();
+     }
+ 
+-    void DRMProcessor::exportPrivateLicenseKey(std::string path)
+-    {
+-        int fd = open(path.c_str(), O_CREAT|O_TRUNC|O_WRONLY, S_IRWXU);
+-        int ret;
+-
+-        if (fd <= 0)
+-            EXCEPTION(GOUROU_FILE_ERROR, "Unable to open " << path);
+-
+-        ByteArray privateLicenseKey = ByteArray::fromBase64(user->getPrivateLicenseKey());
+-        /* In adobekey.py, we get base64 decoded data [26:] */
+-        ret = write(fd, privateLicenseKey.data()+26, privateLicenseKey.length()-26);
+-        close(fd);
+-        if (ret != (int)(privateLicenseKey.length()-26))
+-        {
+-            EXCEPTION(gourou::GOUROU_FILE_ERROR, "Error writing " << path);
+-        }
+-    }
+-
++    
+     int DRMProcessor::getLogLevel() {return (int)gourou::logLevel;}
+     void DRMProcessor::setLogLevel(int logLevel) {gourou::logLevel = (GOUROU_LOG_LEVEL)logLevel;}
+ 
+@@ -1076,489 +1061,9 @@ namespace gourou
+      *
+      * @return Base64 encoded decrypted key
+      */
+-    std::string DRMProcessor::encryptedKeyFirstPass(pugi::xml_document& rightsDoc, const std::string& encryptedKey, const std::string& keyType)
+-    {
+-        unsigned char digest[32], key[16], iv[16];
+-        unsigned int dataOutLength;
+-        std::string id;
+-
+-        client->digest("SHA256", (unsigned char*)keyType.c_str(), keyType.size(), digest);
+-
+-        dumpBuffer(gourou::LG_LOG_DEBUG, "SHA of KeyType : ", digest, sizeof(digest));
+-
+-        long nonce = std::stol(keyType);
+-        int remainder = nonce % 16;
+-
+-        memcpy(key, &digest[remainder*2], 16-remainder);
+-        memcpy(&key[16-remainder], &digest[remainder], remainder);
+-
+-        id = extractTextElem(rightsDoc, "/adept:rights/licenseToken/device");
+-        if (id == "")
+-            EXCEPTION(DRM_ERR_ENCRYPTION_KEY_FP, "Device id not found in rights.xml");
+-        ByteArray deviceId = ByteArray::fromHex(extractIdFromUUID(id));
+-        unsigned char* _deviceId = deviceId.data();
+-
+-        id = extractTextElem(rightsDoc, "/adept:rights/licenseToken/fulfillment");
+-        if (id == "")
+-            EXCEPTION(DRM_ERR_ENCRYPTION_KEY_FP, "Fulfillment id not found in rights.xml");
+-        ByteArray fulfillmentId = ByteArray::fromHex(extractIdFromUUID(id));
+-        unsigned char* _fulfillmentId = fulfillmentId.data();
+-
+-        id = extractTextElem(rightsDoc, "/adept:rights/licenseToken/voucher");
+-        if (id == "")
+-            EXCEPTION(DRM_ERR_ENCRYPTION_KEY_FP, "Voucher id not found in rights.xml");
+-        ByteArray voucherId = ByteArray::fromHex(extractIdFromUUID(id));
+-        unsigned char* _voucherId = voucherId.data();
+-
+-        if (deviceId.size() < sizeof(iv) || fulfillmentId.size() < sizeof(iv) || voucherId.size() < sizeof(iv))
+-            EXCEPTION(DRM_ERR_ENCRYPTION_KEY_FP, "One id has a bad length");
+-
+-        for(unsigned int i=0; i<sizeof(iv); i++)
+-            iv[i] = _deviceId[i] ^ _fulfillmentId[i] ^ _voucherId[i];
+-
+-        dumpBuffer(gourou::LG_LOG_DEBUG, "First pass key : ", key, sizeof(key));
+-        dumpBuffer(gourou::LG_LOG_DEBUG, "First pass IV  : ", iv, sizeof(iv));
+-
+-        ByteArray arrayEncryptedKey = ByteArray::fromBase64(encryptedKey);
+-        unsigned char* clearRSAKey = new unsigned char[arrayEncryptedKey.size()];
+-
+-        client->decrypt(CryptoInterface::ALGO_AES, CryptoInterface::CHAIN_CBC,
+-                        (const unsigned char*)key, (unsigned int)sizeof(key),
+-                        (const unsigned char*)iv, (unsigned int)sizeof(iv),
+-                        (const unsigned char*)arrayEncryptedKey.data(), arrayEncryptedKey.size(),
+-                        (unsigned char*)clearRSAKey, &dataOutLength);
+-
+-        dumpBuffer(gourou::LG_LOG_DEBUG, "\nDecrypted key : ", clearRSAKey, dataOutLength);
+-
+-        /* Last block could be 0x10*16 which is OpenSSL padding, remove it if it's the case */
+-        bool skipLastLine = true;
+-        for(unsigned int i=dataOutLength-16; i<dataOutLength; i++)
+-        {
+-            if (clearRSAKey[i] != 0x10)
+-            {
+-                skipLastLine = false;
+-                break;
+-            }
+-        }
+-
+-        ByteArray res(clearRSAKey, (skipLastLine)?dataOutLength-16:dataOutLength);
+-
+-        delete[] clearRSAKey;
+-
+-        return res.toBase64();
+-    }
+-
+-    void DRMProcessor::decryptADEPTKey(pugi::xml_document& rightsDoc, unsigned char* decryptedKey, const unsigned char* encryptionKey, unsigned encryptionKeySize)
+-    {
+-        unsigned char rsaKey[RSA_KEY_SIZE];
+-
+-        std::string user = extractTextElem(rightsDoc, "/adept:rights/licenseToken/user");
+-
+-        if (!encryptionKey)
+-        {
+-            if (this->user->getUUID() != user)
+-            {
+-                EXCEPTION(DRM_INVALID_USER, "This book has been downloaded for another user (" << user << ")");
+-            }
+-
+-            std::string encryptedKey = extractTextElem(rightsDoc, "/adept:rights/licenseToken/encryptedKey");
+-            std::string keyType = extractTextAttribute(rightsDoc, "/adept:rights/licenseToken/encryptedKey", "keyType", false);
+-
+-            if (keyType != "")
+-                encryptedKey = encryptedKeyFirstPass(rightsDoc, encryptedKey, keyType);
+-
+-            if (encryptedKey.size() != 172)
+-                EXCEPTION(DRM_INVALID_KEY_SIZE, "Invalid encrypted key size (" << encryptedKey.size() << "). DRM version not supported");
+-
+-            ByteArray arrayEncryptedKey = ByteArray::fromBase64(encryptedKey);
+-
+-            std::string privateKeyData = this->user->getPrivateLicenseKey();
+-            ByteArray privateRSAKey = ByteArray::fromBase64(privateKeyData);
+-
+-            dumpBuffer(gourou::LG_LOG_DEBUG, "To decrypt : ", arrayEncryptedKey.data(), arrayEncryptedKey.length());
+-
+-            client->RSAPrivateDecrypt(privateRSAKey.data(), privateRSAKey.length(),
+-                                      RSAInterface::RSA_KEY_PKCS8, "",
+-                                      arrayEncryptedKey.data(), arrayEncryptedKey.length(), rsaKey);
+-
+-            dumpBuffer(gourou::LG_LOG_DEBUG, "Decrypted : ", rsaKey, sizeof(rsaKey));
+-
+-            if (rsaKey[0] != 0x00 || rsaKey[1] != 0x02 ||
+-                rsaKey[RSA_KEY_SIZE-16-1] != 0x00)
+-                EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "Unable to retrieve encryption key");
+-
+-            memcpy(decryptedKey, &rsaKey[sizeof(rsaKey)-16], 16);
+-        }
+-        else
+-        {
+-            GOUROU_LOG(DEBUG, "Use provided encryption key");
+-            if (encryptionKeySize != 16)
+-                EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "Provided encryption key must be 16 bytes");
+-
+-            memcpy(decryptedKey, encryptionKey, encryptionKeySize);
+-        }
+-    }
+-
+-    void DRMProcessor::removeEPubDRM(const std::string& filenameIn, const std::string& filenameOut,
+-                                     const unsigned char* encryptionKey, unsigned encryptionKeySize)
+-    {
+-        ByteArray zipData;
+-        bool removeEncryptionXML = true;
+-        void* zipHandler = client->zipOpen(filenameOut);
+-
+-        client->zipReadFile(zipHandler, "META-INF/rights.xml", zipData);
+-        pugi::xml_document rightsDoc;
+-        rightsDoc.load_string((const char*)zipData.data());
+-
+-        unsigned char decryptedKey[16];
+-
+-        decryptADEPTKey(rightsDoc, decryptedKey, encryptionKey, encryptionKeySize);
+-
+-        client->zipReadFile(zipHandler, "META-INF/encryption.xml", zipData);
+-        pugi::xml_document encryptionDoc;
+-        encryptionDoc.load_string((const char*)zipData.data());
+-
+-        pugi::xpath_node_set nodeSet = encryptionDoc.select_nodes("//EncryptedData");
+-
+-        for (pugi::xpath_node_set::const_iterator it = nodeSet.begin();
+-             it != nodeSet.end(); ++it)
+-        {
+-            pugi::xml_node encryptionMethod = it->node().child("EncryptionMethod");
+-            pugi::xml_node cipherReference  = it->node().child("CipherData").child("CipherReference");
+-
+-            std::string encryptionType = encryptionMethod.attribute("Algorithm").value();
+-            std::string encryptedFile = cipherReference.attribute("URI").value();
+-
+-            if (encryptionType == "")
+-            {
+-                EXCEPTION(DRM_MISSING_PARAMETER, "Missing Algorithm attribute in encryption.xml");
+-            }
+-            else if (encryptionType == "http://www.w3.org/2001/04/xmlenc#aes128-cbc")
+-            {
+-                if (encryptedFile == "")
+-                {
+-                    EXCEPTION(DRM_MISSING_PARAMETER, "Missing URI attribute in encryption.xml");
+-                }
+-
+-                GOUROU_LOG(DEBUG, "Encrypted file " << encryptedFile);
+-
+-                client->zipReadFile(zipHandler, encryptedFile, zipData, false);
+-
+-                unsigned char* _data = zipData.data();
+-                ByteArray clearData(zipData.length()-16+1, true); /* Reserve 1 byte for 'Z' */
+-                unsigned char* _clearData = clearData.data();
+-                gourou::ByteArray inflateData(true);
+-                unsigned int dataOutLength;
+-
+-                client->decrypt(CryptoInterface::ALGO_AES, CryptoInterface::CHAIN_CBC,
+-                                decryptedKey, sizeof(decryptedKey), /* Key */
+-                                _data, 16, /* IV */
+-                                &_data[16], zipData.length()-16,
+-                                _clearData, &dataOutLength);
+-
+-                // Add 'Z' at the end, done in ineptepub.py
+-                _clearData[dataOutLength] = 'Z';
+-                clearData.resize(dataOutLength+1);
+-
+-                try
+-                {
+-                    client->inflate(clearData, inflateData);
+-                    client->zipWriteFile(zipHandler, encryptedFile, inflateData);
+-                }
+-                catch(gourou::Exception& e)
+-                {
+-                    if (e.getErrorCode() == CLIENT_ZIP_ERROR)
+-                    {
+-                        GOUROU_LOG(ERROR, e.what() << std::endl << "Skip file " << encryptedFile);
+-                    }
+-                    else
+-                        throw e;
+-                }
+-
+-                it->node().parent().remove_child(it->node());
+-            }
+-            else
+-            {
+-                GOUROU_LOG(WARN, "Unsupported encryption algorithm " << encryptionType << ", for file " << encryptedFile);
+-                removeEncryptionXML = false;
+-            }
+-        }
+-
+-        client->zipDeleteFile(zipHandler, "META-INF/rights.xml");
+-        if (removeEncryptionXML)
+-            client->zipDeleteFile(zipHandler, "META-INF/encryption.xml");
+-        else
+-        {
+-            StringXMLWriter xmlWriter;
+-            encryptionDoc.save(xmlWriter, "  ");
+-            std::string xmlStr = xmlWriter.getResult();
+-            ByteArray ba(xmlStr);
+-            client->zipWriteFile(zipHandler, "META-INF/encryption.xml", ba);
+-        }
+-
+-        client->zipClose(zipHandler);
+-    }
+-
+-    void DRMProcessor::generatePDFObjectKey(int version,
+-                                            const unsigned char* masterKey, unsigned int masterKeyLength,
+-                                            int objectId, int objectGenerationNumber,
+-                                            unsigned char* keyOut)
+-    {
+-        switch(version)
+-        {
+-        case 4:
+-            ByteArray toHash(masterKey, masterKeyLength);
+-            uint32_t _objectId = objectId;
+-            uint32_t _objectGenerationNumber = objectGenerationNumber;
+-            toHash.append((const unsigned char*)&_objectId, 3); // Fill 3 bytes
+-            toHash.append((const unsigned char*)&_objectGenerationNumber, 2); // Fill 2 bytes
+-
+-            client->digest("md5", toHash.data(), toHash.length(), keyOut);
+-            break;
+-        }
+-    }
+-
+-    void DRMProcessor::removePDFDRM(const std::string& filenameIn, const std::string& filenameOut,
+-                                    const unsigned char* encryptionKey, unsigned encryptionKeySize)
+-    {
+-        uPDFParser::Parser parser;
+-        bool EBXHandlerFound = false;
+-
+-        if (filenameIn == filenameOut)
+-        {
+-            EXCEPTION(DRM_IN_OUT_EQUALS, "PDF IN must be different of PDF OUT");
+-        }
+-
+-        try
+-        {
+-            GOUROU_LOG(DEBUG, "Parse PDF");
+-            parser.parse(filenameIn);
+-        }
+-        catch(std::invalid_argument& e)
+-        {
+-            GOUROU_LOG(ERROR, "Invalid PDF");
+-            return;
+-        }
+-
+-        uPDFParser::Integer* ebxVersion;
+-        std::vector<uPDFParser::Object*> objects = parser.objects();
+-        std::vector<uPDFParser::Object*>::iterator it, ebxIt;
+-        std::vector<uPDFParser::Object*>::reverse_iterator rIt;
+-        std::vector<uPDFParser::Object*> ebxObjects;
+-        unsigned char decryptedKey[16];
+-        int ebxId;
+-
+-        for(rIt = objects.rbegin(); rIt != objects.rend(); rIt++)
+-        {
+-            // Update EBX_HANDLER with rights
+-            if ((*rIt)->hasKey("Filter") && (**rIt)["Filter"]->str() == "/EBX_HANDLER")
+-            {
+-                EBXHandlerFound = true;
+-                uPDFParser::Object* ebx = *rIt;
+-
+-                ebxVersion  = (uPDFParser::Integer*)(*ebx)["V"];
+-                if (ebxVersion->value() != 4)
+-                {
+-                    EXCEPTION(DRM_VERSION_NOT_SUPPORTED, "EBX encryption version not supported " << ebxVersion->value());
+-                }
+-
+-                if (!(ebx->hasKey("ADEPT_LICENSE")))
+-                {
+-                    EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "No ADEPT_LICENSE found");
+-                }
+-
+-                uPDFParser::String* licenseObject = (uPDFParser::String*)(*ebx)["ADEPT_LICENSE"];
+-
+-                std::string value = licenseObject->value();
+-                // Pad with '='
+-                while ((value.size() % 4))
+-                    value += "=";
+-                ByteArray zippedData = ByteArray::fromBase64(value);
+-
+-                if (zippedData.size() == 0)
+-                    EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "Invalid ADEPT_LICENSE");
+-
+-                ByteArray rightsStr;
+-                client->inflate(zippedData, rightsStr);
+-
+-                pugi::xml_document rightsDoc;
+-                rightsDoc.load_string((const char*)rightsStr.data());
+-
+-                decryptADEPTKey(rightsDoc, decryptedKey, encryptionKey, encryptionKeySize);
+-
+-                ebxId = ebx->objectId();
+-
+-                break;
+-            }
+-        }
+-
+-        if (!EBXHandlerFound)
+-        {
+-            EXCEPTION(DRM_ERR_ENCRYPTION_KEY, "EBX_HANDLER not found");
+-        }
+-
+-        for(it = objects.begin(); it != objects.end(); it++)
+-        {
+-            uPDFParser::Object* object = *it;
+-
+-            if (object->objectId() == ebxId)
+-            {
+-                ebxObjects.push_back(object);
+-                continue;
+-            }
+-
+-            // Should not decrypt XRef stream
+-            if (object->hasKey("Type") && (*object)["Type"]->str() == "/XRef")
+-            {
+-                GOUROU_LOG(DEBUG, "XRef stream at " << object->offset());
+-                continue;
+-            }
+-
+-            GOUROU_LOG(DEBUG, "Obj " << object->objectId());
+-
+-            unsigned char tmpKey[sizeof(decryptedKey)];
+-
+-            generatePDFObjectKey(ebxVersion->value(),
+-                                 decryptedKey, sizeof(decryptedKey),
+-                                 object->objectId(), object->generationNumber(),
+-                                 tmpKey);
+-
+-            uPDFParser::Dictionary& dictionary = object->dictionary();
+-            std::map<std::string, uPDFParser::DataType*>& dictValues = dictionary.value();
+-            std::map<std::string, uPDFParser::DataType*>::iterator dictIt;
+-            std::map<std::string, uPDFParser::DataType*> decodedStrings;
+-            std::string string;
+-
+-            /* Parse dictionary */
+-            for (dictIt = dictValues.begin(); dictIt != dictValues.end(); dictIt++)
+-            {
+-                uPDFParser::DataType* dictData = dictIt->second;
+-                if (dictData->type() == uPDFParser::DataType::STRING)
+-                {
+-                    string = ((uPDFParser::String*) dictData)->unescapedValue();
+-
+-                    unsigned char* encryptedData = (unsigned char*)string.c_str();
+-                    unsigned int dataLength = string.size();
+-                    unsigned char* clearData = new unsigned char[dataLength];
+-                    unsigned int dataOutLength;
+-
+-                    GOUROU_LOG(DEBUG, "Decrypt string " << dictIt->first << " " << dataLength);
+-
+-                    client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
+-                                    tmpKey, sizeof(tmpKey), /* Key */
+-                                    NULL, 0, /* IV */
+-                                    encryptedData, dataLength,
+-                                    clearData, &dataOutLength);
+-
+-                    decodedStrings[dictIt->first] = new uPDFParser::String(
+-                        std::string((const char*)clearData, dataOutLength));
+-
+-                    delete[] clearData;
+-                }
+-                else if (dictData->type() == uPDFParser::DataType::HEXASTRING)
+-                {
+-                    string = ((uPDFParser::HexaString*) dictData)->value();
+-                    ByteArray hexStr = ByteArray::fromHex(string);
+-
+-                    unsigned char* encryptedData = hexStr.data();
+-                    unsigned int dataLength = hexStr.size();
+-                    unsigned char* clearData = new unsigned char[dataLength];
+-                    unsigned int dataOutLength;
+-
+-                    GOUROU_LOG(DEBUG, "Decrypt hexa string " << dictIt->first << " " << dataLength);
+-
+-                    client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
+-                                    tmpKey, sizeof(tmpKey), /* Key */
+-                                    NULL, 0, /* IV */
+-                                    encryptedData, dataLength,
+-                                    clearData, &dataOutLength);
+-
+-                    ByteArray clearHexStr = ByteArray(clearData, dataOutLength);
+-                    decodedStrings[dictIt->first] = new uPDFParser::HexaString(
+-                        clearHexStr.toHex());
+-
+-                    delete[] clearData;
+-                }
+-            }
+-
+-            for (dictIt = decodedStrings.begin(); dictIt != decodedStrings.end(); dictIt++)
+-                dictionary.replace(dictIt->first, dictIt->second);
+-
+-            std::vector<uPDFParser::DataType*>::iterator datasIt;
+-            std::vector<uPDFParser::DataType*>& datas = object->data();
+-            uPDFParser::Stream* stream;
+-
+-            for (datasIt = datas.begin(); datasIt != datas.end(); datasIt++)
+-            {
+-                if ((*datasIt)->type() != uPDFParser::DataType::STREAM)
+-                    continue;
+-
+-                stream = (uPDFParser::Stream*) (*datasIt);
+-                unsigned char* encryptedData = stream->data();
+-                unsigned int dataLength = stream->dataLength();
+-                unsigned char* clearData = new unsigned char[dataLength];
+-                unsigned int dataOutLength;
+-
+-                GOUROU_LOG(DEBUG, "Decrypt stream id " << object->objectId() << ", size " << stream->dataLength());
+-
+-                client->decrypt(CryptoInterface::ALGO_RC4, CryptoInterface::CHAIN_ECB,
+-                                tmpKey, sizeof(tmpKey), /* Key */
+-                                NULL, 0, /* IV */
+-                                encryptedData, dataLength,
+-                                clearData, &dataOutLength);
+-
+-                stream->setData(clearData, dataOutLength, true);
+-                if (dataOutLength != dataLength)
+-                    GOUROU_LOG(DEBUG, "New size " << dataOutLength);
+-            }
+-        }
+-
+-        /* Delete objects that reference EBX objects,
+-           except in trailer and objects that references Info */
+-        for(it = objects.begin(); it != objects.end(); it++)
+-        {
+-            uPDFParser::Object* object = *it;
+-
+-            if (object->hasKey("Encrypt") && (*object)["Encrypt"]->type() == uPDFParser::DataType::REFERENCE)
+-            {
+-                uPDFParser::Reference* encrypt = (uPDFParser::Reference*)(*object)["Encrypt"];
+-                
+-                if (object->hasKey("Info"))
+-                {
+-                    object->deleteKey("Encrypt");
+-                    continue;
+-                }
+-                
+-                /* Delete EBX objects */
+-                for(ebxIt = ebxObjects.begin(); ebxIt != ebxObjects.end(); ebxIt++)
+-                {
+-                    if (encrypt->value() == (*ebxIt)->objectId())
+-                    {
+-                        GOUROU_LOG(DEBUG, "Delete stream id " << object->objectId());
+-                        
+-                        parser.removeObject(object);
+-                        break;
+-                    }
+-                }
+-            }
+-        }
+-        
+-        /* Delete EBX objects */
+-        for(it = ebxObjects.begin(); it != ebxObjects.end(); it++)
+-            parser.removeObject(*it);
+-
+-        uPDFParser::Object& trailer = parser.getTrailer();
+-        trailer.deleteKey("Encrypt");
+-
+-        parser.write(filenameOut);
+-    }
+-
+-    void DRMProcessor::removeDRM(const std::string& filenameIn, const std::string& filenameOut,
+-                                 ITEM_TYPE type, const unsigned char* encryptionKey, unsigned encryptionKeySize)
+-    {
+-        if (type == PDF)
+-            removePDFDRM(filenameIn, filenameOut, encryptionKey, encryptionKeySize);
+-        else
+-            removeEPubDRM(filenameIn, filenameOut, encryptionKey, encryptionKeySize);
++    
++    
++    
++    
++    
+     }
+-}
+diff --git a/src/user.cpp b/src/user.cpp
+index 14251b0..40e209c 100644
+--- a/src/user.cpp
++++ b/src/user.cpp
+@@ -61,9 +61,8 @@ namespace gourou {
+             }
+ 
+             if (loginMethod == "anonymous")
+-                username = "anonymous";
+-            else
+-                username    = gourou::extractTextElem(activationDoc, "//adept:username", throwOnNull);
++                EXCEPTION(USER_INVALID_ACTIVATION_FILE, "Anonymous activation is disabled");
++            username = gourou::extractTextElem(activationDoc, "//adept:username", throwOnNull);
+ 
+             pugi::xpath_node_set nodeSet = activationDoc.select_nodes("//adept:licenseServices/adept:licenseServiceInfo");
+             for (pugi::xpath_node_set::const_iterator it = nodeSet.begin();
+diff --git a/utils/Makefile b/utils/Makefile
+index 2b4bfda..6e1f84b 100644
+--- a/utils/Makefile
++++ b/utils/Makefile
+@@ -1,10 +1,10 @@
+ BINDIR ?= /bin
+ MANDIR ?= /share/man
+ 
+-TARGET_BINARIES=acsmdownloader adept_activate adept_remove adept_loan_mgt
++TARGET_BINARIES=acsmdownloader adept_activate adept_loan_mgt
+ TARGETS=$(TARGET_BINARIES) launcher
+ 
+-MAN_PAGES=acsmdownloader adept_activate adept_remove adept_loan_mgt
++MAN_PAGES=acsmdownloader adept_activate adept_loan_mgt
+ 
+ CXXFLAGS=-Wall -fPIC -I$(ROOT)/include -fmacro-prefix-map=$(ROOT)/= -fdata-sections -ffunction-sections
+ 
+diff --git a/utils/acsmdownloader.cpp b/utils/acsmdownloader.cpp
+index cc9a5d9..c2fba79 100644
+--- a/utils/acsmdownloader.cpp
++++ b/utils/acsmdownloader.cpp
+@@ -42,7 +42,6 @@ static const char* deviceFile     = "device.xml";
+ static const char* activationFile = "activation.xml";
+ static const char* devicekeyFile  = "devicesalt";
+ static const char* acsmFile       = 0;
+-static       bool  exportPrivateKey = false;
+ static const char* outputFile     = 0;
+ static const char* outputDir      = 0;
+ static       bool  resume         = false;
+@@ -59,30 +58,7 @@ public:
+         try
+         {
+             gourou::DRMProcessor processor(&client, deviceFile, activationFile, devicekeyFile);
+-            gourou::User* user = processor.getUser();
+-    
+-            if (exportPrivateKey)
+-            {
+-                std::string filename;
+-                if (outputFile)
+-                    filename = outputFile;
+-                else
+-                {
+-                    filename = std::string("Adobe_PrivateLicenseKey--") + user->getUsername() + ".der";
+-
+-                    if (outputDir)
+-                        filename = std::string(outputDir) + "/" + filename;
+-                }
+-
+-                createPath(filename.c_str());
+-                
+-                processor.exportPrivateLicenseKey(filename);
+-
+-                std::cout << "Private license key exported to " << filename << std::endl;
+-            }
+-            else
+-            {
+-                gourou::FulfillmentItem* item = processor.fulfill(acsmFile, notify);
++            gourou::FulfillmentItem* item = processor.fulfill(acsmFile, notify);
+ 
+                 std::string filename;
+                 if (outputFile)
+@@ -119,7 +95,6 @@ public:
+                 std::cout << "Created " << filename << std::endl;
+ 
+                 serializeLoanToken(item);
+-            }
+         } catch(std::exception& e)
+         {
+             std::cout << e.what() << std::endl;
+@@ -185,7 +160,6 @@ static void usage(const char* cmd)
+     std::cout << "  " << "-O|--output-dir"      << "\t"   << "Optional output directory were to put result (default ./) (not compatible with -o)" << std::endl;
+     std::cout << "  " << "-o|--output-file"     << "\t"   << "Optional output filename (default <title.(epub|pdf|der)>) (not compatible with -O)" << std::endl;
+     std::cout << "  " << "-f|--acsm-file"       << "\t"   << "Backward compatibility: ACSM request file for epub download" << std::endl;
+-    std::cout << "  " << "-e|--export-private-key"<< "\t" << "Export private key in DER format" << std::endl;
+     std::cout << "  " << "-r|--resume"          << "\t\t" << "Try to resume download (in case of previous failure)" << std::endl;
+     std::cout << "  " << "-N|--no-notify"       << "\t\t" << "Don't notify server, even if requested" << std::endl;
+     std::cout << "  " << "-v|--verbose"         << "\t\t" << "Increase verbosity, can be set multiple times" << std::endl;
+@@ -228,7 +202,6 @@ int main(int argc, char** argv)
+             {"output-dir",       required_argument, 0,  'O' },
+             {"output-file",      required_argument, 0,  'o' },
+             {"acsm-file",        required_argument, 0,  'f' },
+-            {"export-private-key",no_argument,      0,  'e' },
+             {"resume",           no_argument,       0,  'r' },
+             {"no-notify",        no_argument,       0,  'N' },
+             {"verbose",          no_argument,       0,  'v' },
+@@ -237,7 +210,7 @@ int main(int argc, char** argv)
+             {0,                  0,                 0,  0 }
+         };
+ 
+-        c = getopt_long(argc, argv, "D:d:a:k:O:o:f:erNvVh",
++        c = getopt_long(argc, argv, "D:d:a:k:O:o:f:rNvVh",
+                         long_options, &option_index);
+         if (c == -1)
+             break;
+@@ -269,9 +242,6 @@ int main(int argc, char** argv)
+         case 'o':
+             outputFile = optarg;
+             break;
+-        case 'e':
+-            exportPrivateKey = true;
+-            break;
+         case 'r':
+             resume = true;
+             break;
+@@ -298,7 +268,7 @@ int main(int argc, char** argv)
+     if (optind == argc-1)
+         acsmFile = argv[optind];
+ 
+-    if ((!acsmFile && !exportPrivateKey) || (outputDir && !outputDir[0]) ||
++    if (!acsmFile || (outputDir && !outputDir[0]) ||
+         (outputFile && !outputFile[0]))
+     {
+         usage(argv[0]);
+@@ -331,22 +301,11 @@ int main(int argc, char** argv)
+     if (hasErrors)
+         goto end;
+ 
+-    if (exportPrivateKey)
+-    {
+-        if (acsmFile)
+-        {
+-            usage(argv[0]);
+-            return -1;
+-        }
+-    }
+-    else
++    if (!pathExists(acsmFile))
+     {
+-        if (!pathExists(acsmFile))
+-        {
+-            std::cout << "Error : " << acsmFile << " doesn't exists" << std::endl;
+-            ret = -1;
+-            goto end;
+-        }
++        std::cout << "Error : " << acsmFile << " doesn't exists" << std::endl;
++        ret = -1;
++        goto end;
+     }
+ 
+     ret = downloader.run();
+diff --git a/utils/adept_activate.cpp b/utils/adept_activate.cpp
+index b12b617..c224635 100644
+--- a/utils/adept_activate.cpp
++++ b/utils/adept_activate.cpp
+@@ -130,7 +130,6 @@ static void usage(const char* cmd)
+     std::cout << "Usage: " << basename((char*)cmd) << " OPTIONS" << std::endl << std::endl;
+ 
+     std::cout << "Global Options:" << std::endl;
+-    std::cout << "  " << "-a|--anonymous"  << "\t"   << "Anonymous account, no need for username/password (Use it only with a DRM removal software)" << std::endl;
+     std::cout << "  " << "-u|--username"   << "\t\t" << "AdobeID username (ie adobe.com email account)" << std::endl;
+     std::cout << "  " << "-p|--password"   << "\t\t" << "AdobeID password (asked if not set via command line) " << std::endl;
+     std::cout << "  " << "-O|--output-dir" << "\t"   << "Optional output directory were to put result (default ./.adept). This directory must not already exists" << std::endl;
+@@ -159,12 +158,10 @@ int main(int argc, char** argv)
+     int c, ret = -1;
+     const char* _outputDir = outputDir;
+     int verbose = gourou::DRMProcessor::getLogLevel();
+-    bool anonymous = false;
+ 
+     while (1) {
+         int option_index = 0;
+         static struct option long_options[] = {
+-            {"anonymous",     no_argument      , 0,  'a' },
+             {"username",      required_argument, 0,  'u' },
+             {"password",      required_argument, 0,  'p' },
+             {"output-dir",    required_argument, 0,  'O' },
+@@ -176,15 +173,12 @@ int main(int argc, char** argv)
+             {0,               0,                 0,  0 }
+         };
+ 
+-        c = getopt_long(argc, argv, "au:p:O:H:rvVh",
++        c = getopt_long(argc, argv, "u:p:O:H:rvVh",
+                         long_options, &option_index);
+         if (c == -1)
+             break;
+ 
+         switch (c) {
+-        case 'a':
+-            anonymous = true;
+-            break;
+         case 'u':
+             username = optarg;
+             break;
+@@ -217,19 +211,12 @@ int main(int argc, char** argv)
+ 
+     gourou::DRMProcessor::setLogLevel(verbose);
+ 
+-    if ((!username && !anonymous) ||
+-        (username && anonymous))
++    if (!username)
+     {
+         usage(argv[0]);
+         return -1;
+     }
+ 
+-    if (anonymous)
+-    {
+-        username = "anonymous";
+-        password = "";
+-    }
+-
+     if (!_outputDir || _outputDir[0] == 0)
+     {
+         outputDir = strdup(gourou::DRMProcessor::getDefaultAdeptDir().c_str());
+diff --git a/utils/adept_remove.cpp b/utils/adept_remove.cpp
+deleted file mode 100644
+index d72b321..0000000
+--- a/utils/adept_remove.cpp
++++ /dev/null
+@@ -1,330 +0,0 @@
+-/*
+-  Copyright (c) 2021, Grégory Soutadé
+-
+-  All rights reserved.
+-  Redistribution and use in source and binary forms, with or without
+-  modification, are permitted provided that the following conditions are met:
+-
+-  * Redistributions of source code must retain the above copyright
+-  notice, this list of conditions and the following disclaimer.
+-  * Redistributions in binary form must reproduce the above copyright
+-  notice, this list of conditions and the following disclaimer in the
+-  documentation and/or other materials provided with the distribution.
+-  * Neither the name of the copyright holder nor the
+-  names of its contributors may be used to endorse or promote products
+-  derived from this software without specific prior written permission.
+-
+-  THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND ANY
+-  EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+-  WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+-  DISCLAIMED. IN NO EVENT SHALL THE REGENTS AND CONTRIBUTORS BE LIABLE FOR ANY
+-  DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+-  (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+-  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+-  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+-  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+-  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+-*/
+-
+-#include <getopt.h>
+-#include <libgen.h>
+-
+-#include <iostream>
+-
+-#include <libgourou.h>
+-#include <libgourou_common.h>
+-
+-#include "drmprocessorclientimpl.h"
+-#include "utils_common.h"
+-
+-static const char* deviceFile     = "device.xml";
+-static const char* activationFile = "activation.xml";
+-static const char* devicekeyFile  = "devicesalt";
+-static const char* inputFile      = 0;
+-static const char* outputFile     = 0;
+-static const char* outputDir      = 0;
+-
+-static char*          encryptionKeyUser  = 0;
+-static unsigned char* encryptionKey      = 0;
+-static unsigned       encryptionKeySize  = 0;
+-
+-static inline unsigned char htoi(unsigned char c)
+-{
+-    if (c >= '0' && c <= '9')
+-        c -= '0';
+-    else if (c >= 'a' && c <= 'f')
+-        c -= 'a' - 10;
+-    else if (c >= 'A' && c <= 'F')
+-        c -= 'A' - 10;
+-    else
+-        EXCEPTION(gourou::USER_INVALID_INPUT, "Invalid character " << c << " in encryption key");
+-
+-    return c;
+-}
+-
+-static inline bool endsWith(const std::string& s, const std::string& suffix)
+-{
+-    return s.rfind(suffix) == std::abs((int)(s.size()-suffix.size()));
+-}
+-
+-class ADEPTRemove
+-{
+-public:
+-
+-    int run()
+-    {
+-        int ret = 0;
+-        try
+-        {
+-            gourou::DRMProcessor::ITEM_TYPE type;
+-            DRMProcessorClientImpl client;
+-            gourou::DRMProcessor processor(&client, deviceFile, activationFile, devicekeyFile);
+-    
+-            std::string filename;
+-            if (outputFile)
+-                filename = outputFile;
+-            else
+-            {
+-                filename = std::string(inputFile);
+-
+-                if (outputDir)
+-                {
+-                    char* basepath = strdup(inputFile);
+-                    filename = std::string(outputDir) + "/" + basename(basepath);
+-                    free(basepath);
+-                }
+-            }
+-            
+-            if (endsWith(filename, ".epub"))
+-                type = gourou::DRMProcessor::ITEM_TYPE::EPUB;
+-            else if (endsWith(filename, ".pdf"))
+-                type = gourou::DRMProcessor::ITEM_TYPE::PDF;
+-            else
+-            {
+-                EXCEPTION(gourou::DRM_FORMAT_NOT_SUPPORTED, "Unsupported file format of " << filename);
+-            }
+-
+-            createPath(filename.c_str());
+-
+-            if (inputFile != filename)
+-            {
+-                unlink(filename.c_str());
+-                fileCopy(inputFile, filename.c_str());
+-                processor.removeDRM(inputFile, filename, type, encryptionKey, encryptionKeySize);
+-                std::cout << "DRM removed into new file " << filename << std::endl;
+-            }
+-            else
+-            {
+-                // Use temp file for PDF
+-                if (type == gourou::DRMProcessor::ITEM_TYPE::PDF)
+-                {
+-                    std::string tempFile = filename + ".tmp";
+-                    /* Be sure there is not already a temp file */
+-                    unlink(tempFile.c_str());
+-                    processor.removeDRM(filename, tempFile, type, encryptionKey, encryptionKeySize);
+-                    /* Original file must be removed before doing a copy... */
+-                    unlink(filename.c_str());
+-                    if (rename(tempFile.c_str(), filename.c_str()))
+-                    {
+-                        EXCEPTION(gourou::DRM_FILE_ERROR, "Unable to copy " << tempFile << " into " << filename);
+-                    }
+-                }
+-                else
+-                    processor.removeDRM(inputFile, filename, type, encryptionKey, encryptionKeySize);
+-                std::cout << "DRM removed from " << filename << std::endl;
+-            }
+-        } catch(std::exception& e)
+-        {
+-            std::cout << e.what() << std::endl;
+-            ret = 1;
+-        }
+-
+-        return ret;
+-    }
+-};    
+-
+-static void usage(const char* cmd)
+-{
+-    std::cout << basename((char*)cmd) << " remove ADEPT DRM (from Adobe) of EPUB/PDF file" << std::endl << std::endl;
+-
+-    std::cout << "Usage: " << basename((char*)cmd) << " [OPTIONS] file(.epub|pdf)" << std::endl << std::endl;
+-
+-    std::cout << "Global Options:" << std::endl;
+-    std::cout << "  " << "-O|--output-dir"      << "\t"   << "Optional output directory were to put result (default ./) (not compatible with -o)" << std::endl;
+-    std::cout << "  " << "-o|--output-file"     << "\t"   << "Optional output filename (default inplace DRM removal>) (not compatible with -O)" << std::endl;
+-    std::cout << "  " << "-f|--input-file"      << "\t"   << "Backward compatibility: EPUB/PDF file to process" << std::endl;
+-    std::cout << "  " << "-v|--verbose"         << "\t\t" << "Increase verbosity, can be set multiple times" << std::endl;
+-    std::cout << "  " << "-V|--version"         << "\t\t" << "Display libgourou version" << std::endl;
+-    std::cout << "  " << "-h|--help"            << "\t\t" << "This help" << std::endl;
+-
+-    std::cout << "ADEPT Options:" << std::endl;
+-    std::cout << "  " << "-D|--adept-directory" << "\t"   << ".adept directory that must contains device.xml, activation.xml and devicesalt" << std::endl;
+-    std::cout << "  " << "-d|--device-file"     << "\t"   << "device.xml file from eReader" << std::endl;
+-    std::cout << "  " << "-a|--activation-file" << "\t"   << "activation.xml file from eReader" << std::endl;
+-    std::cout << "  " << "-k|--device-key-file" << "\t"   << "private device key file (eg devicesalt/devkey.bin) from eReader" << std::endl;
+-
+-    std::cout << std::endl;
+-
+-    std::cout << "Environment:" << std::endl;
+-    std::cout << "Device file, activation file and device key file are optionals. If not set, they are looked into :" << std::endl;
+-    std::cout << "  * $ADEPT_DIR environment variable" << std::endl;
+-    std::cout << "  * /home/<user>/.config/adept" << std::endl;
+-    std::cout << "  * Current directory" << std::endl;
+-    std::cout << "  * .adept" << std::endl;
+-    std::cout << "  * adobe-digital-editions directory" << std::endl;
+-    std::cout << "  * .adobe-digital-editions directory" << std::endl;
+-}
+-
+-int main(int argc, char** argv)
+-{
+-    int c, ret = -1;
+-
+-    const char** files[] = {&devicekeyFile, &deviceFile, &activationFile};
+-    int verbose = gourou::DRMProcessor::getLogLevel();
+-    std::string _deviceFile, _activationFile, _devicekeyFile;
+-
+-    while (1) {
+-        int option_index = 0;
+-        static struct option long_options[] = {
+-            {"adept-directory",  required_argument, 0,  'D' },
+-            {"device-file",      required_argument, 0,  'd' },
+-            {"activation-file",  required_argument, 0,  'a' },
+-            {"device-key-file",  required_argument, 0,  'k' },
+-            {"output-dir",       required_argument, 0,  'O' },
+-            {"output-file",      required_argument, 0,  'o' },
+-            {"input-file",       required_argument, 0,  'f' },
+-            {"encryption-key",   required_argument, 0,  'K' }, // Private option
+-            {"verbose",          no_argument,       0,  'v' },
+-            {"version",          no_argument,       0,  'V' },
+-            {"help",             no_argument,       0,  'h' },
+-            {0,                  0,                 0,  0 }
+-        };
+-
+-        c = getopt_long(argc, argv, "D:d:a:k:O:o:f:K:vVh",
+-                        long_options, &option_index);
+-        if (c == -1)
+-            break;
+-
+-        switch (c) {
+-        case 'D':
+-            _deviceFile = std::string(optarg) + "/device.xml";
+-            _activationFile = std::string(optarg) + "/activation.xml";
+-            _devicekeyFile = std::string(optarg) + "/devicesalt";
+-            deviceFile = _deviceFile.c_str();
+-            activationFile = _activationFile.c_str();
+-            devicekeyFile = _devicekeyFile.c_str();
+-            break;
+-        case 'd':
+-            deviceFile = optarg;
+-            break;
+-        case 'a':
+-            activationFile = optarg;
+-            break;
+-        case 'k':
+-            devicekeyFile = optarg;
+-            break;
+-        case 'f':
+-            inputFile = optarg;
+-            break;
+-        case 'O':
+-            outputDir = optarg;
+-            break;
+-        case 'o':
+-            outputFile = optarg;
+-            break;
+-        case 'K':
+-            encryptionKeyUser = optarg;
+-            break;
+-        case 'v':
+-            verbose++;
+-            break;
+-        case 'V':
+-            version();
+-            return 0;
+-        case 'h':
+-            usage(argv[0]);
+-            return 0;
+-        default:
+-            usage(argv[0]);
+-            return -1;
+-        }
+-    }
+-
+-    gourou::DRMProcessor::setLogLevel(verbose);
+-
+-    if (optind == argc-1)
+-        inputFile = argv[optind];
+-
+-    if (!inputFile || (outputDir && !outputDir[0]) ||
+-        (outputFile && !outputFile[0]))
+-    {
+-        usage(argv[0]);
+-        return -1;
+-    }
+-
+-    if (outputDir && outputFile)
+-    {
+-        std::cout << "Error : you cannot use both -o and -O" << std::endl;
+-        return -1;
+-    }
+-    
+-    ADEPTRemove remover;
+-
+-    int i;
+-    bool hasErrors = false;
+-    const char* orig;
+-    for (i=0; i<(int)ARRAY_SIZE(files); i++)
+-    {
+-        orig = *files[i];
+-        *files[i] = findFile(*files[i]);
+-        if (!*files[i])
+-        {
+-            std::cout << "Error : " << orig << " doesn't exists, did you activate your device ?" << std::endl;
+-            ret = -1;
+-            hasErrors = true;
+-        }
+-    }
+-
+-    if (encryptionKeyUser)
+-    {
+-        int size = std::string(encryptionKeyUser).size();
+-        if ((size % 2))
+-        {
+-            std::cout << "Error : Encryption key must be odd length" << std::endl;
+-            goto end;
+-        }
+-
+-        if (encryptionKeyUser[0] == '0' && encryptionKeyUser[1] == 'x')
+-        {
+-            encryptionKeyUser += 2;
+-            size -= 2;
+-        }
+-
+-        encryptionKey = new unsigned char[size/2];
+-
+-        for(i=0; i<size; i+=2)
+-        {
+-            encryptionKey[i/2]  = htoi(encryptionKeyUser[i]) << 4;
+-            encryptionKey[i/2] |= htoi(encryptionKeyUser[i+1]);
+-        }
+-
+-        encryptionKeySize = size/2;
+-    }
+-
+-    if (hasErrors)
+-        goto end;
+-
+-    ret = remover.run();
+-
+-end:
+-    for (i=0; i<(int)ARRAY_SIZE(files); i++)
+-    {
+-        if (*files[i])
+-            free((void*)*files[i]);
+-    }
+-
+-    if (encryptionKey)
+-        free(encryptionKey);
+-
+-    return ret;
+-}
+diff --git a/utils/man/acsmdownloader.1 b/utils/man/acsmdownloader.1
+index 32fc08a..aef5834 100644
+--- a/utils/man/acsmdownloader.1
++++ b/utils/man/acsmdownloader.1
+@@ -18,9 +18,6 @@ Optional output filename (default <title.(epub|pdf|der)>)
+ \fB\-f\fR|\-\-acsm\-file
+ Backward compatibility: ACSM request file for epub download
+ .TP
+-\fB\-e\fR|\-\-export\-private\-key
+-Export private key in DER format
+-.TP
+ \fB\-r\fR|\-\-resume
+ Try to resume download (in case of previous failure)
+ .TP
+diff --git a/utils/man/adept_activate.1 b/utils/man/adept_activate.1
+index 1516f38..61b0b61 100644
+--- a/utils/man/adept_activate.1
++++ b/utils/man/adept_activate.1
+@@ -9,9 +9,6 @@ adept_activate create new device files used by ADEPT DRM
+ Create new device files used by ADEPT DRM
+ .SS "Global Options:"
+ .TP
+-\fB\-a\fR|\-\-anonymous
+-Anonymous account, no need for username/password (Use it only with a DRM removal software)
+-.TP
+ \fB\-u\fR|\-\-username
+ AdobeID username (ie adobe.com email account)
+ .TP
+@@ -39,9 +36,6 @@ This help
+ Usage: adept_activate OPTIONS
+ .SS "Global Options:"
+ .TP
+-\fB\-a\fR|\-\-anonymous
+-Anonymous account, no need for username/password (Use it only with a DRM removal software)
+-.TP
+ \fB\-u\fR|\-\-username
+ AdobeID username (ie adobe.com email account)
+ .TP
+diff --git a/utils/man/adept_remove.1 b/utils/man/adept_remove.1
+deleted file mode 100644
+index f1d446f..0000000
+--- a/utils/man/adept_remove.1
++++ /dev/null
+@@ -1,55 +0,0 @@
+-.\" DO NOT MODIFY THIS FILE!  It was generated by help2man 1.49.3.
+-.TH ADEPT_REMOVE "1" "January 2023" "adept_remove remove ADEPT DRM (from Adobe) of EPUB/PDF file" "User Commands"
+-.SH NAME
+-adept_remove remove ADEPT DRM (from Adobe) of EPUB/PDF file
+-.SH SYNOPSIS
+-.B adept_remove
+-[\fI\,OPTIONS\/\fR] \fI\,file(.epub|pdf)\/\fR
+-.SH DESCRIPTION
+-Remove ADEPT DRM (from Adobe) of EPUB/PDF file
+-.SS "Global Options:"
+-.TP
+-\fB\-O\fR|\-\-output\-dir
+-Optional output directory were to put result (default ./)
+-.TP
+-\fB\-o\fR|\-\-output\-file
+-Optional output filename (default inplace DRM removal>)
+-.TP
+-\fB\-f\fR|\-\-input\-file
+-Backward compatibility: EPUB/PDF file to process
+-.TP
+-\fB\-v\fR|\-\-verbose
+-Increase verbosity, can be set multiple times
+-.TP
+-\fB\-V\fR|\-\-version
+-Display libgourou version
+-.TP
+-\fB\-h\fR|\-\-help
+-This help
+-.SS "ADEPT Options:"
+-.TP
+-\fB\-D\fR|\-\-adept\-directory
+-\&.adept directory that must contains device.xml, activation.xml and devicesalt
+-.TP
+-\fB\-d\fR|\-\-device\-file
+-device.xml file from eReader
+-.TP
+-\fB\-a\fR|\-\-activation\-file
+-activation.xml file from eReader
+-.TP
+-\fB\-k\fR|\-\-device\-key\-file
+-private device key file (eg devicesalt/devkey.bin) from eReader
+-.SH ENVIRONMENT
+-.SS "Device file, activation file and device key file are optionals. If not set, they are looked into :"
+-.IP
+-* $ADEPT_DIR environment variable
+-.IP
+-* /home/<user>/.config/adept
+-.IP
+-* Current directory
+-.IP
+-* .adept
+-.IP
+-* adobe\-digital\-editions directory
+-.IP
+-* .adobe\-digital\-editions directory

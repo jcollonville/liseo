@@ -1,0 +1,28 @@
+services:
+  liseo:
+    image: ghcr.io/jcollonville/liseo:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - liseo-data:/data
+    tmpfs:
+      - /tmp
+    environment:
+      LISEO_ADMIN_PASSWORD: ${LISEO_ADMIN_PASSWORD:?set it in .env}
+      LISEO_SECRET_KEY: ${LISEO_SECRET_KEY:?set it in .env}
+      LISEO_ALLOWED_OPERATORS: ${LISEO_ALLOWED_OPERATORS:-acs4.edenlivres.fr}
+      LISEO_PUBLIC_URL: ${LISEO_PUBLIC_URL:-http://localhost:8080}
+      TZ: ${TZ:-Europe/Paris}
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  liseo-data:
