@@ -1,0 +1,109 @@
+:root {
+  color: #1c1915;
+  background: #f4efe6;
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  line-height: 1.45;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+}
+
+button, input {
+  font: inherit;
+}
+
+button {
+  background: #1c1915;
+  color: #f4efe6;
+  border: 0;
+  border-radius: 999px;
+  padding: 0.55rem 1rem;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  color: #1c1915;
+  border: 1px solid #1c1915;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input[type="password"], input[type="text"] {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #c8bfb2;
+  border-radius: 0.4rem;
+  background: white;
+}
+
+main {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+}
+
+h1 {
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  margin-bottom: 0.25rem;
+}
+
+.lede, .hint, .meta {
+  color: #5c564e;
+}
+
+.card {
+  background: white;
+  border: 1px solid #e4dcd0;
+  border-radius: 0.9rem;
+  padding: 1rem 1.1rem;
+  margin: 1rem 0;
+}
+
+label {
+  display: block;
+  margin: 0.7rem 0;
+}
+
+.drop {
+  border: 1.5px dashed #8a8175;
+  border-radius: 0.9rem;
+  padding: 1.4rem 1rem;
+  text-align: center;
+  background: #faf7f2;
+}
+
+.drop.ready { border-color: #1c1915; }
+
+.error {
+  background: #fde8e4;
+  border: 1px solid #e7b2a8;
+  color: #6d2418;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.85rem;
+}
+
+.ok {
+  background: #e7f2e4;
+  border: 1px solid #b7d4ae;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.85rem;
+}
+
+ul.books {
+  padding-left: 1.1rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
